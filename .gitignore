@@ -1,0 +1,33 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Go build cache
+*.test
+*.out
+/vendor/
+
+# Environment — NEVER commit real credentials
+.env
+.env.local
+.env.*.local
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Docker volumes (if mounted locally)
+postgres_data/
+prometheus_data/
+grafana_data/
