@@ -7,8 +7,9 @@ type State string
 const (
 	StatePending              State = "PENDING"
 	StatePaymentProcessing    State = "PAYMENT_PROCESSING"
-	StatePaymentSuccess       State = "PAYMENT_SUCCESS"
 	StatePaymentFailed        State = "PAYMENT_FAILED"
+	StateRetryingPayment      State = "RETRYING_PAYMENT"   // scheduled for retry, backoff in progress
+	StatePaymentSuccess       State = "PAYMENT_SUCCESS"
 	StateInventoryProcessing  State = "INVENTORY_PROCESSING"
 	StateInventoryReserved    State = "INVENTORY_RESERVED"
 	StateInventoryFailed      State = "INVENTORY_FAILED"
@@ -17,29 +18,36 @@ const (
 	StateDLQ                  State = "DLQ"
 )
 
-// validTransitions is the state machine definition.
-// Any transition not listed here is rejected by the engine, preventing
-// stale retries from rolling back a completed workflow.
+// validTransitions is the authoritative state machine definition.
+//
+// New retry flow with RETRYING_PAYMENT:
+//
+//	PAYMENT_PROCESSING → PAYMENT_FAILED        (payment attempt failed)
+//	PAYMENT_FAILED     → RETRYING_PAYMENT      (retry scheduled, backoff timer running)
+//	RETRYING_PAYMENT   → PAYMENT_PROCESSING    (backoff elapsed, event republished)
+//	RETRYING_PAYMENT   → DLQ                   (max retries exhausted)
+//
+// This gives clean, inspectable semantics. An order in RETRYING_PAYMENT
+// tells you exactly: "payment failed, we're waiting to try again."
+// Previously PAYMENT_FAILED was overloaded for both "failed" and "waiting to retry."
 var validTransitions = map[State][]State{
 	StatePending:             {StatePaymentProcessing},
 	StatePaymentProcessing:   {StatePaymentSuccess, StatePaymentFailed, StateDLQ},
+	StatePaymentFailed:       {StateRetryingPayment, StateFailed},
+	StateRetryingPayment:     {StatePaymentProcessing, StateDLQ},
 	StatePaymentSuccess:      {StateInventoryProcessing},
-	StatePaymentFailed:       {StatePaymentProcessing, StateFailed}, // PAYMENT_PROCESSING allows retry
 	StateInventoryProcessing: {StateInventoryReserved, StateInventoryFailed, StateDLQ},
 	StateInventoryFailed:     {StateInventoryProcessing, StateFailed},
 	StateInventoryReserved:   {StateCompleted},
 }
 
+// IsValidTransition reports whether moving from → to is permitted.
+// DLQ is always valid as an emergency escape hatch.
 func IsValidTransition(from, to State) bool {
-	// DLQ is always a valid escape hatch regardless of current state.
 	if to == StateDLQ {
 		return true
 	}
-	allowed, ok := validTransitions[from]
-	if !ok {
-		return false
-	}
-	for _, s := range allowed {
+	for _, s := range validTransitions[from] {
 		if s == to {
 			return true
 		}
@@ -49,10 +57,9 @@ func IsValidTransition(from, to State) bool {
 
 func (s State) String() string { return string(s) }
 
-// ErrInvalidTransition is returned when a requested transition is not in the state machine.
 type ErrInvalidTransition struct {
-	From State
-	To   State
+	From    State
+	To      State
 	OrderID string
 }
 

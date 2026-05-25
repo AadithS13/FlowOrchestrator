@@ -70,32 +70,50 @@
                              │ ORDER_CREATED
                              ▼
                   ┌──────────────────────┐
-                  │  PAYMENT_PROCESSING  │◀──── retry (backoff)
-                  └──────┬──────────────┘
-               success   │       │ failure
-              ───────────┘       └──────────────────────────┐
-              ▼                                              ▼
-  ┌───────────────────┐                         ┌───────────────────┐
-  │  PAYMENT_SUCCESS  │                         │  PAYMENT_FAILED   │
-  └─────────┬─────────┘                         └────────┬──────────┘
-            │                                            │ max retries
-            ▼                                            ▼
- ┌─────────────────────┐                          ┌──────────┐
- │ INVENTORY_PROCESSING│                          │   DLQ    │
- └──────────┬──────────┘                          └──────────┘
-            │
-            ▼
- ┌─────────────────────┐
- │  INVENTORY_RESERVED │
- └──────────┬──────────┘
-            │
-            ▼
-      ┌───────────┐
-      │ COMPLETED │
-      └───────────┘
+                  │  PAYMENT_PROCESSING  │◀─────────────────────┐
+                  └──────┬──────────────┘                       │
+               success   │       │ failure                      │
+                         │       ▼                              │
+                         │  ┌─────────────────┐                │
+                         │  │  PAYMENT_FAILED  │                │
+                         │  └────────┬─────────┘                │
+                         │           │ retry scheduled           │
+                         │           ▼                          │
+                         │  ┌──────────────────────┐           │
+                         │  │  RETRYING_PAYMENT     │───────────┘
+                         │  │  (backoff in progress)│  backoff elapsed
+                         │  └──────────┬────────────┘
+                         │             │ max retries exceeded
+                         │             ▼
+                         │       ┌──────────┐
+                         │       │   DLQ    │
+                         │       └──────────┘
+                         ▼
+              ┌───────────────────┐
+              │  PAYMENT_SUCCESS  │
+              └─────────┬─────────┘
+                        │
+                        ▼
+             ┌─────────────────────┐
+             │ INVENTORY_PROCESSING│
+             └──────────┬──────────┘
+                        │
+                        ▼
+             ┌─────────────────────┐
+             │  INVENTORY_RESERVED │
+             └──────────┬──────────┘
+                        │
+                        ▼
+                  ┌───────────┐
+                  │ COMPLETED │
+                  └───────────┘
 ```
 
-Every transition is **validated** — a stale retry can never roll back a completed order.
+**Why `RETRYING_PAYMENT` instead of looping back directly?**
+
+With the old design, `PAYMENT_FAILED` was overloaded — it meant both "terminal failure" and "waiting to retry." The new state makes the backoff window **observable**: an order in `RETRYING_PAYMENT` tells you exactly "payment failed, retry is scheduled." You can query `SELECT * FROM orders WHERE status = 'RETRYING_PAYMENT'` and know precisely which orders are mid-retry and when they'll fire next.
+
+Every transition is **validated** — a stale retry can never roll back a completed order. Same-state transitions are treated as idempotent no-ops.
 
 ---
 
@@ -276,6 +294,53 @@ curl -s -X POST http://localhost:8081/orders \
 
 ```bash
 curl -s http://localhost:8081/orders/<order_id> | jq .
+```
+
+---
+
+## Load Testing
+
+```bash
+# Default: 100 orders, 10 concurrent workers
+go run ./cmd/loadtest/...
+
+# 500 orders, 50 workers
+go run ./cmd/loadtest/... -n 500 -c 50
+
+# Custom target
+go run ./cmd/loadtest/... -n 1000 -c 100 -url http://localhost:8081
+```
+
+Sample output:
+```
+🚀 FlowOrchestrator Load Test
+   Orders:  100
+   Workers: 10
+   Target:  http://localhost:8081
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Total time    : 1.24s
+  Orders/sec    : 80.6
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ✅ Success (201): 100
+  ❌ Failed  (4xx): 0
+  💥 Net errors  : 0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Latency (ms):
+    min  : 8.0 ms
+    p50  : 12.0 ms
+    p90  : 18.0 ms
+    p95  : 22.0 ms
+    p99  : 31.0 ms
+    max  : 45.0 ms
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Run load test **with 100% failure rate** to see retry/DLQ behaviour at scale:
+```bash
+curl -X POST http://localhost:8082/config/payment-failure-rate -d '{"rate":100}'
+go run ./cmd/loadtest/... -n 50 -c 10
+# Watch 50 orders flow through retry → DLQ in Kafka UI and DBeaver
 ```
 
 ---

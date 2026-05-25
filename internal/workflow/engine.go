@@ -48,6 +48,14 @@ func (e *Engine) Transition(ctx context.Context, in TransitionInput) error {
 		return fmt.Errorf("workflow engine: get state: %w", err)
 	}
 
+	// Same-state transition = idempotent no-op.
+	// This happens legitimately when a retry consumer receives a message
+	// after a crash-recovery: the state was already written, the event
+	// replays, we try to transition to the same state. Safe to skip.
+	if currentState == in.ToState {
+		return tx.Rollback()
+	}
+
 	if !IsValidTransition(currentState, in.ToState) {
 		return ErrInvalidTransition{From: currentState, To: in.ToState, OrderID: in.OrderID}
 	}

@@ -39,7 +39,6 @@ func (h *PaymentHandler) Handle(ctx context.Context, msg segkafka.Message) error
 		return nil
 	}
 
-	// Enrich context + logger with correlation fields for every downstream call
 	ctx = logger.WithCorrelation(ctx, evt.CorrelationID, evt.OrderID)
 	ctx = logger.WithAttempt(ctx, evt.AttemptCount)
 	log := logger.FromContext(ctx, h.log)
@@ -51,10 +50,8 @@ func (h *PaymentHandler) Handle(ctx context.Context, msg segkafka.Message) error
 		Msg("received ORDER_CREATED")
 
 	// ── Idempotency ───────────────────────────────────────────────────────
-	// Include attempt_count in the key — the retry scheduler republishes the
-	// same event_id with attempt_count incremented, so each attempt must have
-	// its own unique key. Without this, attempt 1 looks identical to attempt 0
-	// and gets skipped as a duplicate.
+	// attempt_count is part of the key: same event_id is reused across
+	// retries, so each attempt needs its own unique idempotency slot.
 	idemKey := fmt.Sprintf("%s:%s:%d", serviceName, evt.EventID, evt.AttemptCount)
 	if err := h.idem.CheckAndMark(ctx, idemKey, evt.OrderID, evt.EventType); err != nil {
 		if errors.Is(err, idempotency.ErrDuplicate) {
@@ -63,6 +60,24 @@ func (h *PaymentHandler) Handle(ctx context.Context, msg segkafka.Message) error
 			return nil
 		}
 		return fmt.Errorf("idempotency check: %w", err)
+	}
+
+	// ── Advance state on retry: RETRYING_PAYMENT → PAYMENT_PROCESSING ────
+	// On the first attempt (0) the order is already in PAYMENT_PROCESSING
+	// (set by the order service). On subsequent attempts it is in
+	// RETRYING_PAYMENT — move it back to PAYMENT_PROCESSING so the audit
+	// log clearly shows each processing cycle.
+	if evt.AttemptCount > 0 {
+		if err := h.engine.Transition(ctx, workflow.TransitionInput{
+			OrderID:   evt.OrderID,
+			ToState:   workflow.StatePaymentProcessing,
+			EventType: "RETRY_ATTEMPT",
+			Service:   serviceName,
+		}); err != nil {
+			log.Warn().Err(err).Msg("RETRYING_PAYMENT→PAYMENT_PROCESSING transition error (non-fatal)")
+		} else {
+			log.Info().Int("attempt", evt.AttemptCount).Msg("🔁 retry attempt — back to PAYMENT_PROCESSING")
+		}
 	}
 
 	// ── Payment processing ────────────────────────────────────────────────
@@ -113,12 +128,16 @@ func (h *PaymentHandler) handleSuccess(ctx context.Context, log zerolog.Logger, 
 }
 
 func (h *PaymentHandler) handleFailure(ctx context.Context, log zerolog.Logger, evt events.OrderCreatedEvent, payErr error) error {
+	willRetry := retry.DefaultPolicy.ShouldRetry(evt.AttemptCount)
+
 	log.Warn().
 		Err(payErr).
 		Int("attempt", evt.AttemptCount).
 		Int("max_attempts", retry.DefaultPolicy.MaxAttempts).
+		Bool("will_retry", willRetry).
 		Msg("❌ payment failed")
 
+	// Always publish PAYMENT_FAILED so notification service can react.
 	failEvt := events.PaymentEvent{
 		BaseEvent: events.BaseEvent{
 			EventID:        uuid.New().String(),
@@ -136,32 +155,57 @@ func (h *PaymentHandler) handleFailure(ctx context.Context, log zerolog.Logger, 
 	}
 	_ = h.producer.Publish(ctx, kafka.TopicPaymentEvents, evt.OrderID, failEvt)
 
+	// ── Transition: PAYMENT_PROCESSING → PAYMENT_FAILED ──────────────────
+	if err := h.engine.Transition(ctx, workflow.TransitionInput{
+		OrderID:   evt.OrderID,
+		ToState:   workflow.StatePaymentFailed,
+		EventType: events.EventPaymentFailed,
+		Service:   serviceName,
+	}); err != nil {
+		log.Warn().Err(err).Msg("PAYMENT_FAILED transition error (non-fatal)")
+	}
+
+	if willRetry {
+		// ── Transition: PAYMENT_FAILED → RETRYING_PAYMENT ────────────────
+		// This state clearly communicates "failed, waiting for backoff"
+		// distinct from a terminal failure.
+		if err := h.engine.Transition(ctx, workflow.TransitionInput{
+			OrderID:   evt.OrderID,
+			ToState:   workflow.StateRetryingPayment,
+			EventType: "RETRY_SCHEDULED",
+			Service:   serviceName,
+		}); err != nil {
+			log.Warn().Err(err).Msg("RETRYING_PAYMENT transition error (non-fatal)")
+		}
+
+		delay := retry.DefaultPolicy.Delay(evt.AttemptCount)
+		log.Info().
+			Dur("retry_in", delay).
+			Int("next_attempt", evt.AttemptCount+1).
+			Msg("🔄 retry scheduled → RETRYING_PAYMENT")
+
+		observability.RetryScheduled.WithLabelValues(
+			serviceName, evt.EventType, fmt.Sprintf("%d", evt.AttemptCount+1),
+		).Inc()
+	} else {
+		// ── Max retries exceeded → DLQ ────────────────────────────────────
+		if err := h.engine.Transition(ctx, workflow.TransitionInput{
+			OrderID:   evt.OrderID,
+			ToState:   workflow.StateDLQ,
+			EventType: "MAX_RETRIES_EXCEEDED",
+			Service:   serviceName,
+		}); err != nil {
+			log.Warn().Err(err).Msg("DLQ transition error (non-fatal)")
+		}
+		log.Error().Msg("🪦 max retries exceeded — moving to DLQ")
+		observability.DLQEvents.WithLabelValues(serviceName, evt.EventType).Inc()
+	}
+
+	// Persist retry or DLQ record.
 	if err := h.scheduler.Schedule(ctx, evt.OrderID, evt.EventType,
 		kafka.TopicOrderCreated, evt, evt.AttemptCount, payErr,
 	); err != nil {
 		log.Error().Err(err).Msg("scheduler error")
-	}
-
-	toState := workflow.StatePaymentFailed
-	if !retry.DefaultPolicy.ShouldRetry(evt.AttemptCount) {
-		toState = workflow.StateDLQ
-		log.Error().Msg("🪦 max retries exceeded — moving to DLQ")
-		observability.DLQEvents.WithLabelValues(serviceName, evt.EventType).Inc()
-	} else {
-		delay := retry.DefaultPolicy.Delay(evt.AttemptCount)
-		log.Info().Dur("retry_in", delay).Int("next_attempt", evt.AttemptCount+1).Msg("🔄 retry scheduled")
-		observability.RetryScheduled.WithLabelValues(
-			serviceName, evt.EventType, fmt.Sprintf("%d", evt.AttemptCount+1),
-		).Inc()
-	}
-
-	if err := h.engine.Transition(ctx, workflow.TransitionInput{
-		OrderID:   evt.OrderID,
-		ToState:   toState,
-		EventType: events.EventPaymentFailed,
-		Service:   serviceName,
-	}); err != nil {
-		log.Warn().Err(err).Msg("workflow transition error (non-fatal)")
 	}
 
 	observability.EventsProcessed.WithLabelValues(serviceName, evt.EventType, "failed").Inc()
@@ -169,10 +213,8 @@ func (h *PaymentHandler) handleFailure(ctx context.Context, log zerolog.Logger, 
 }
 
 // processPayment simulates a real payment gateway using the live failure rate.
-// Rate is controlled at runtime via POST /config/payment-failure-rate.
 func processPayment(amount float64) error {
 	time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
-
 	if rand.Float64() < getFailureRate() {
 		reasons := []string{
 			"payment gateway timeout",
