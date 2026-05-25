@@ -51,7 +51,11 @@ func (h *PaymentHandler) Handle(ctx context.Context, msg segkafka.Message) error
 		Msg("received ORDER_CREATED")
 
 	// ── Idempotency ───────────────────────────────────────────────────────
-	idemKey := fmt.Sprintf("%s:%s", serviceName, evt.EventID)
+	// Include attempt_count in the key — the retry scheduler republishes the
+	// same event_id with attempt_count incremented, so each attempt must have
+	// its own unique key. Without this, attempt 1 looks identical to attempt 0
+	// and gets skipped as a duplicate.
+	idemKey := fmt.Sprintf("%s:%s:%d", serviceName, evt.EventID, evt.AttemptCount)
 	if err := h.idem.CheckAndMark(ctx, idemKey, evt.OrderID, evt.EventType); err != nil {
 		if errors.Is(err, idempotency.ErrDuplicate) {
 			log.Warn().Str("idem_key", idemKey).Msg("duplicate event — skipping")
